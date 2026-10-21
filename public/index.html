@@ -1,0 +1,249 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hello Stranger</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:wght@400;600;800&display=swap" rel="stylesheet">
+<style>
+  :root { --bg:#e9efee; --panel:#fbfdfc; --ink:#1d2a33; --muted:#5f7079; --line:#cbd7d4;
+          --accent:#0f6b63; --accent-ink:#fff; --danger:#a7281c; --stage:#22313a; }
+  * { box-sizing:border-box; }
+  html,body { height:100%; margin:0; }
+  body { font-family:"Bricolage Grotesque",system-ui,sans-serif; background:var(--bg); color:var(--ink); }
+  button { font:inherit; cursor:pointer; border:0; border-radius:8px; padding:.7rem 1.1rem; font-weight:600; }
+  button:focus-visible, input:focus-visible { outline:3px solid #f2b705; outline-offset:2px; }
+  .primary { background:var(--accent); color:var(--accent-ink); }
+  .ghost { background:transparent; color:var(--ink); border:1px solid var(--line); }
+  .danger { background:transparent; color:var(--danger); border:1px solid var(--danger); }
+  button:disabled { opacity:.45; cursor:not-allowed; }
+
+  #gate { min-height:100%; display:grid; place-items:center; padding:1.5rem; }
+  #gate .card { max-width:30rem; background:var(--panel); border:1px solid var(--line); border-radius:14px; padding:2rem; }
+  #gate h1 { font-size:2.6rem; line-height:1; margin:0 0 .8rem; font-weight:800; letter-spacing:-.03em; }
+  #gate p { color:var(--muted); line-height:1.55; margin:.4rem 0 1rem; }
+  #gate label { display:flex; gap:.6rem; align-items:flex-start; margin:1rem 0 1.4rem; line-height:1.4; }
+  #err { color:var(--danger); min-height:1.3em; margin:.8rem 0 0; }
+
+  #app { display:none; height:100%; grid-template-columns:1fr 22rem; gap:.8rem; padding:.8rem; }
+  #stage { position:relative; background:var(--stage); border-radius:14px; overflow:hidden; min-height:0; }
+  #remote { width:100%; height:100%; object-fit:cover; background:var(--stage); }
+  #local { position:absolute; right:.8rem; bottom:.8rem; width:9.5rem; aspect-ratio:4/3; object-fit:cover;
+           border-radius:10px; border:2px solid #fff; background:#000; transform:scaleX(-1); }
+  #status { position:absolute; inset:0; display:grid; place-items:center; color:#dbe7e4; font-size:1.3rem;
+            text-align:center; padding:1rem; pointer-events:none; }
+  #online { position:absolute; left:.8rem; top:.8rem; color:#dbe7e4; font-size:.9rem; }
+  #side { display:flex; flex-direction:column; background:var(--panel); border:1px solid var(--line); border-radius:14px; min-height:0; }
+  #log { flex:1; overflow-y:auto; padding:1rem; display:flex; flex-direction:column; gap:.5rem; }
+  .msg { max-width:85%; padding:.5rem .75rem; border-radius:10px; line-height:1.35; overflow-wrap:anywhere; }
+  .me { align-self:flex-end; background:var(--accent); color:#fff; }
+  .them { align-self:flex-start; background:#e3ebe9; }
+  .sys { align-self:center; color:var(--muted); font-size:.9rem; text-align:center; }
+  #composer { display:flex; gap:.5rem; padding:.7rem; border-top:1px solid var(--line); }
+  #composer input { flex:1; min-width:0; font:inherit; padding:.65rem .8rem; border:1px solid var(--line); border-radius:8px; }
+  #controls { display:flex; gap:.5rem; padding:.7rem; border-top:1px solid var(--line); flex-wrap:wrap; }
+  #controls button { flex:1; }
+  @media (max-width:800px) {
+    #app { grid-template-columns:1fr; grid-template-rows:minmax(0,1.1fr) minmax(0,1fr); }
+    #local { width:6.5rem; }
+  }
+  @media (prefers-color-scheme:dark) {
+    :root { --bg:#141d21; --panel:#1c282e; --ink:#e4efec; --muted:#93a8a3; --line:#33454c; --accent:#2fb3a5; --accent-ink:#06201d; --danger:#ff8a7d; }
+    .them { background:#2a3a41; }
+  }
+</style>
+</head>
+<body>
+
+<main id="gate">
+  <div class="card">
+    <h1>Hello, stranger.</h1>
+    <p>Talk face to face with a random person. Your video goes straight to them, not through our server.</p>
+    <p>Be kind. Anyone who is reported repeatedly gets blocked.</p>
+    <label><input type="checkbox" id="age"> I am 18 or older and I agree to follow the rules.</label>
+    <button class="primary" id="enter" disabled>Allow camera and start</button>
+    <p id="err" role="alert"></p>
+  </div>
+</main>
+
+<div id="app">
+  <section id="stage" aria-label="Video chat">
+    <video id="remote" autoplay playsinline></video>
+    <video id="local" autoplay playsinline muted></video>
+    <div id="status">Press Next to meet someone.</div>
+    <div id="online"></div>
+  </section>
+  <aside id="side">
+    <div id="log" aria-live="polite"></div>
+    <form id="composer" autocomplete="off">
+      <input id="text" maxlength="500" placeholder="Type a message" disabled aria-label="Message">
+      <button class="primary" id="send" disabled>Send</button>
+    </form>
+    <div id="controls">
+      <button class="primary" id="next">Next</button>
+      <button class="ghost" id="stop" disabled>Stop</button>
+      <button class="danger" id="report" disabled>Report</button>
+    </div>
+  </aside>
+</div>
+
+<script src="/socket.io/socket.io.js"></script>
+<script>
+  // Add a TURN server here for production; without it ~10-20% of connections will fail on strict networks.
+  const ICE_SERVERS = [
+    { urls: 'stun:stun.l.google.com:19302' },
+    // { urls: 'turn:your-turn-host:3478', username: 'user', credential: 'pass' },
+  ];
+
+  const $ = (id) => document.getElementById(id);
+  const socket = io();
+  let pc = null, localStream = null, pendingIce = [], inChat = false;
+
+  // ---------- Gate ----------
+  $('age').onchange = (e) => ($('enter').disabled = !e.target.checked);
+  $('enter').onclick = async () => {
+    try {
+      localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+    } catch (e) {
+      $('err').textContent = 'Camera and microphone access is needed. Allow it in your browser settings and try again.';
+      return;
+    }
+    $('local').srcObject = localStream;
+    $('gate').style.display = 'none';
+    $('app').style.display = 'grid';
+    findPartner();
+  };
+
+  // ---------- UI helpers ----------
+  const setStatus = (t) => { $('status').textContent = t; $('status').style.display = t ? 'grid' : 'none'; };
+  function addMsg(text, cls) {
+    const d = document.createElement('div');
+    d.className = 'msg ' + cls;
+    d.textContent = text;                    // textContent prevents XSS
+    $('log').appendChild(d);
+    $('log').scrollTop = $('log').scrollHeight;
+  }
+  function setChatting(on) {
+    inChat = on;
+    $('text').disabled = $('send').disabled = $('report').disabled = !on;
+  }
+
+  // ---------- WebRTC ----------
+  function closePeer() {
+    if (pc) { pc.ontrack = pc.onicecandidate = pc.onconnectionstatechange = null; pc.close(); pc = null; }
+    $('remote').srcObject = null;
+    pendingIce = [];
+  }
+
+  function createPeer() {
+    closePeer();
+    pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+    localStream.getTracks().forEach((t) => pc.addTrack(t, localStream));
+    pc.ontrack = (e) => { $('remote').srcObject = e.streams[0]; setStatus(''); };
+    pc.onicecandidate = (e) => e.candidate && socket.emit('signal', { type: 'ice', candidate: e.candidate });
+    pc.onconnectionstatechange = () => {
+      if (!pc) return;
+      if (pc.connectionState === 'failed') {
+        setStatus('Connection failed. Press Next to try someone else.');
+        addMsg('Could not connect (network may need a TURN server).', 'sys');
+      }
+    };
+  }
+
+  async function flushIce() {
+    for (const c of pendingIce) { try { await pc.addIceCandidate(c); } catch {} }
+    pendingIce = [];
+  }
+
+  // ---------- Socket events ----------
+  function findPartner() {
+    closePeer();
+    $('log').innerHTML = '';
+    setChatting(false);
+    $('stop').disabled = false;
+    setStatus('Looking for someone...');
+    socket.emit('find');
+  }
+
+  socket.on('waiting', () => setStatus('Looking for someone...'));
+
+  socket.on('matched', async ({ initiator }) => {
+    createPeer();
+    setChatting(true);
+    setStatus('Connecting...');
+    addMsg('You are connected. Say hello!', 'sys');
+    if (initiator) {
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      socket.emit('signal', { type: 'offer', sdp: pc.localDescription });
+    }
+  });
+
+  socket.on('signal', async (m) => {
+    if (!pc) return;                                   // stale message from an old partner
+    try {
+      if (m.type === 'offer') {
+        await pc.setRemoteDescription(m.sdp);
+        await flushIce();
+        const answer = await pc.createAnswer();
+        await pc.setLocalDescription(answer);
+        socket.emit('signal', { type: 'answer', sdp: pc.localDescription });
+      } else if (m.type === 'answer') {
+        await pc.setRemoteDescription(m.sdp);
+        await flushIce();
+      } else if (m.type === 'ice') {
+        if (pc.remoteDescription) await pc.addIceCandidate(m.candidate);
+        else pendingIce.push(m.candidate);             // arrived before the offer/answer
+      }
+    } catch (e) { console.error('signal error', e); }
+  });
+
+  socket.on('chat', (t) => addMsg(t, 'them'));
+  socket.on('notice', (t) => addMsg(t, 'sys'));
+  socket.on('online', (n) => ($('online').textContent = n + ' online'));
+
+  socket.on('partner-left', () => {
+    closePeer();
+    setChatting(false);
+    addMsg('The other person left.', 'sys');
+    setStatus('They left. Press Next to meet someone new.');
+  });
+
+  socket.on('banned', () => {
+    closePeer();
+    setChatting(false);
+    $('next').disabled = $('stop').disabled = true;
+    setStatus('You have been blocked for 1 hour after repeated reports.');
+  });
+
+  // ---------- Buttons ----------
+  $('next').onclick = findPartner;
+  $('stop').onclick = () => {
+    socket.emit('stop');
+    closePeer();
+    setChatting(false);
+    $('stop').disabled = true;
+    setStatus('Stopped. Press Next to meet someone.');
+  };
+  $('report').onclick = () => {
+    if (!inChat || !confirm('Report this person and move on?')) return;
+    closePeer();
+    setChatting(false);
+    $('log').innerHTML = '';
+    setStatus('Report sent. Looking for someone new...');
+    socket.emit('report');
+  };
+  $('composer').onsubmit = (e) => {
+    e.preventDefault();
+    const t = $('text').value.trim();
+    if (!t || !inChat) return;
+    socket.emit('chat', t);
+    addMsg(t, 'me');
+    $('text').value = '';
+  };
+
+  window.addEventListener('beforeunload', () => localStream && localStream.getTracks().forEach((t) => t.stop()));
+</script>
+</body>
+</html>
