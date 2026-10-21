@@ -10,11 +10,36 @@ const BAN_MS = 60 * 60 * 1000;
 
 const app = express();
 const server = http.createServer(app);
-const io = new Server(server, { maxHttpBufferSize: 1e5 });
+const io = new Server(server, {
+  maxHttpBufferSize: 1e6,
+  pingTimeout: 60000,
+  pingInterval: 25000,
+});
 
 app.set('trust proxy', true);
 app.use(express.static(path.join(__dirname, 'public')));
 app.get('/health', (_req, res) => res.send('ok'));
+
+function iceServers() {
+  const servers = [
+    {
+      urls: [
+        'stun:stun.l.google.com:19302',
+        'stun:stun1.l.google.com:19302',
+        'stun:stun2.l.google.com:19302',
+        'stun:stun.cloudflare.com:3478',
+      ],
+    },
+  ];
+  const urls = (process.env.TURN_URLS || '').split(',').map((s) => s.trim()).filter(Boolean);
+  const username = process.env.TURN_USERNAME;
+  const credential = process.env.TURN_CREDENTIAL;
+  if (urls.length && username && credential) {
+    servers.push({ urls, username, credential });
+  }
+  return servers;
+}
+app.get('/ice', (_req, res) => res.json(iceServers()));
 
 // In-memory state. For multiple server instances, move these to Redis + the Socket.IO Redis adapter.
 const waiting = [];            // socket ids waiting for a partner

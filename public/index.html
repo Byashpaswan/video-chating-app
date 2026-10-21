@@ -69,8 +69,8 @@
 
 <div id="app">
   <section id="stage" aria-label="Video chat">
-    <video id="remote" autoplay playsinline></video>
-    <video id="local" autoplay playsinline muted></video>
+    <video id="remote" autoplay playsinline webkit-playsinline></video>
+    <video id="local" autoplay playsinline webkit-playsinline muted></video>
     <div id="status">Press Next to meet someone.</div>
     <div id="online"></div>
   </section>
@@ -90,26 +90,37 @@
 
 <script src="/socket.io/socket.io.js"></script>
 <script>
-  // Add a TURN server here for production; without it ~10-20% of connections will fail on strict networks.
-  const ICE_SERVERS = [
-    { urls: 'stun:stun.l.google.com:19302' },
-    // { urls: 'turn:your-turn-host:3478', username: 'user', credential: 'pass' },
+  let iceServers = [
+    { urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302', 'stun:stun.cloudflare.com:3478'] },
   ];
 
   const $ = (id) => document.getElementById(id);
-  const socket = io();
-  let pc = null, localStream = null, pendingIce = [], inChat = false;
+  const socket = io({ transports: ['websocket', 'polling'] });
+  let pc = null, localStream = null, pendingIce = [], pendingSignals = [], inChat = false, iceRestarted = false;
 
   // ---------- Gate ----------
   $('age').onchange = (e) => ($('enter').disabled = !e.target.checked);
   $('enter').onclick = async () => {
     try {
-      localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+      const ice = await fetch('/ice').then((r) => r.json());
+      if (Array.isArray(ice) && ice.length) iceServers = ice;
+    } catch {}
+    try {
+      localStream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true },
+        video: { facingMode: 'user', width: { ideal: 640 }, height: { ideal: 480 } },
+      });
     } catch (e) {
-      $('err').textContent = 'Camera and microphone access is needed. Allow it in your browser settings and try again.';
-      return;
+      try {
+        localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+      } catch {
+        $('err').textContent = 'Camera and microphone access is needed. Allow it in your browser settings and try again.';
+        return;
+      }
     }
-    $('local').srcObject = localStream;
+    const local = $('local');
+    local.srcObject = localStream;
+    local.play().catch(() => {});
     $('gate').style.display = 'none';
     $('app').style.display = 'grid';
     findPartner();
@@ -129,26 +140,73 @@
     $('text').disabled = $('send').disabled = $('report').disabled = !on;
   }
 
+  function playRemote() {
+    const el = $('remote');
+    const start = () => {
+      el.muted = true;
+      el.play().then(() => { el.muted = false; }).catch(() => {});
+    };
+    if (el.readyState >= 1) start();
+    else el.onloadedmetadata = start;
+  }
+
   // ---------- WebRTC ----------
   function closePeer() {
-    if (pc) { pc.ontrack = pc.onicecandidate = pc.onconnectionstatechange = null; pc.close(); pc = null; }
+    if (pc) {
+      pc.ontrack = pc.onicecandidate = pc.onconnectionstatechange = pc.oniceconnectionstatechange = null;
+      pc.close();
+      pc = null;
+    }
     $('remote').srcObject = null;
     pendingIce = [];
+    iceRestarted = false;
   }
 
   function createPeer() {
+    const queued = pendingSignals;
+    pendingSignals = [];
     closePeer();
-    pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+    pc = new RTCPeerConnection({ iceServers, iceCandidatePoolSize: 10 });
     localStream.getTracks().forEach((t) => pc.addTrack(t, localStream));
-    pc.ontrack = (e) => { $('remote').srcObject = e.streams[0]; setStatus(''); };
-    pc.onicecandidate = (e) => e.candidate && socket.emit('signal', { type: 'ice', candidate: e.candidate });
+    pc.ontrack = (e) => {
+      const el = $('remote');
+      if (e.streams && e.streams[0]) el.srcObject = e.streams[0];
+      else {
+        if (!(el.srcObject instanceof MediaStream)) el.srcObject = new MediaStream();
+        const stream = el.srcObject;
+        if (!stream.getTracks().some((t) => t.id === e.track.id)) stream.addTrack(e.track);
+      }
+      playRemote();
+      setStatus('');
+    };
+    pc.onicecandidate = (e) => {
+      if (!e.candidate) return;
+      socket.emit('signal', {
+        type: 'ice',
+        candidate: {
+          candidate: e.candidate.candidate,
+          sdpMid: e.candidate.sdpMid,
+          sdpMLineIndex: e.candidate.sdpMLineIndex,
+          usernameFragment: e.candidate.usernameFragment,
+        },
+      });
+    };
     pc.onconnectionstatechange = () => {
       if (!pc) return;
+      if (pc.connectionState === 'connected') setStatus('');
       if (pc.connectionState === 'failed') {
         setStatus('Connection failed. Press Next to try someone else.');
-        addMsg('Could not connect (network may need a TURN server).', 'sys');
+        addMsg('Could not connect. Phone and laptop often need a TURN server on Render (TURN_URLS).', 'sys');
       }
     };
+    pc.oniceconnectionstatechange = () => {
+      if (!pc) return;
+      if (pc.iceConnectionState === 'failed' && !iceRestarted && pc.restartIce) {
+        iceRestarted = true;
+        pc.restartIce();
+      }
+    };
+    queued.forEach((m) => handleSignal(m));
   }
 
   async function flushIce() {
@@ -158,6 +216,7 @@
 
   // ---------- Socket events ----------
   function findPartner() {
+    pendingSignals = [];
     closePeer();
     $('log').innerHTML = '';
     setChatting(false);
@@ -174,29 +233,34 @@
     setStatus('Connecting...');
     addMsg('You are connected. Say hello!', 'sys');
     if (initiator) {
-      const offer = await pc.createOffer();
+      const offer = await pc.createOffer({ offerToReceiveAudio: true, offerToReceiveVideo: true });
       await pc.setLocalDescription(offer);
-      socket.emit('signal', { type: 'offer', sdp: pc.localDescription });
+      socket.emit('signal', { type: 'offer', sdp: { type: pc.localDescription.type, sdp: pc.localDescription.sdp } });
     }
   });
 
-  socket.on('signal', async (m) => {
-    if (!pc) return;                                   // stale message from an old partner
+  async function handleSignal(m) {
+    if (!pc || !m) return;
     try {
       if (m.type === 'offer') {
-        await pc.setRemoteDescription(m.sdp);
+        await pc.setRemoteDescription(new RTCSessionDescription(m.sdp));
         await flushIce();
         const answer = await pc.createAnswer();
         await pc.setLocalDescription(answer);
-        socket.emit('signal', { type: 'answer', sdp: pc.localDescription });
+        socket.emit('signal', { type: 'answer', sdp: { type: pc.localDescription.type, sdp: pc.localDescription.sdp } });
       } else if (m.type === 'answer') {
-        await pc.setRemoteDescription(m.sdp);
+        await pc.setRemoteDescription(new RTCSessionDescription(m.sdp));
         await flushIce();
-      } else if (m.type === 'ice') {
+      } else if (m.type === 'ice' && m.candidate) {
         if (pc.remoteDescription) await pc.addIceCandidate(m.candidate);
-        else pendingIce.push(m.candidate);             // arrived before the offer/answer
+        else pendingIce.push(m.candidate);
       }
     } catch (e) { console.error('signal error', e); }
+  }
+
+  socket.on('signal', (m) => {
+    if (!pc) { pendingSignals.push(m); return; }
+    handleSignal(m);
   });
 
   socket.on('chat', (t) => addMsg(t, 'them'));
@@ -204,6 +268,7 @@
   socket.on('online', (n) => ($('online').textContent = n + ' online'));
 
   socket.on('partner-left', () => {
+    pendingSignals = [];
     closePeer();
     setChatting(false);
     addMsg('The other person left.', 'sys');
@@ -211,6 +276,7 @@
   });
 
   socket.on('banned', () => {
+    pendingSignals = [];
     closePeer();
     setChatting(false);
     $('next').disabled = $('stop').disabled = true;
@@ -221,6 +287,7 @@
   $('next').onclick = findPartner;
   $('stop').onclick = () => {
     socket.emit('stop');
+    pendingSignals = [];
     closePeer();
     setChatting(false);
     $('stop').disabled = true;
@@ -228,6 +295,7 @@
   };
   $('report').onclick = () => {
     if (!inChat || !confirm('Report this person and move on?')) return;
+    pendingSignals = [];
     closePeer();
     setChatting(false);
     $('log').innerHTML = '';
